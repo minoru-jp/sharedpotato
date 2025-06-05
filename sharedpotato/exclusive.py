@@ -21,7 +21,8 @@ from typing import Any, Optional
 from contextlib import asynccontextmanager
 import logging
 
-from typedefs import TimeoutType
+from typedefs import Seconds
+from sentinels import ANONYMOUS
 from exceptions import LockTimeout
 
 from asyncvlog import vlog_on_lock_released
@@ -60,31 +61,15 @@ class ExclusiveLock(Protocol):
     def locked(self): ...
 
 
-class _DefaultCallee:
-    """
-    Placeholder object used as the default value for the `callee` argument.
-    This object is intended only for internal use within this module and should not be instantiated elsewhere.
-
-    ja:
-    `callee` 引数のデフォルト値として使用されるプレースホルダーオブジェクトです。
-    このオブジェクトは本モジュール内部での使用を意図しており、
-    他の場所でインスタンス化すべきではありません。
-    """
-    def __repr__(self):
-        return "<DefaultCallee>"
-
-DEFAULT_CALLEE = _DefaultCallee()
-
-
 @asynccontextmanager
 async def acquire_lock_with_timeout(
     exlock: ExclusiveLock,
     *,
-    callee: Any = DEFAULT_CALLEE,
+    callee: Any = ANONYMOUS,
     mn: str = "<unknown>",
     after_set: Optional[asyncio.Event] = None,
     after_clear: Optional[asyncio.Event] = None,
-    timeout: TimeoutType = None):
+    timeout: Seconds = None):
     """
     An async context manager that acquires a lock with timeout and optionally signals completion via events.
 
