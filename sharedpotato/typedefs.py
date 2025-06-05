@@ -67,7 +67,7 @@ NullableValue = Optional[T]
 
 Seconds = Optional[float]
 
-ResourceCleanup = Callable[[T], Any]
+ResourceCleanup = Callable[[T], R]
 
 ManagerCleanup = Union[
     Callable[[RawValue], Any],
