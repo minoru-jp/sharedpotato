@@ -23,7 +23,7 @@ import asyncio
 import inspect
 from contextlib import asynccontextmanager
 
-from typing import Protocol, Callable, Any, Awaitable, TypeVar, Generic, Optional, Union
+from typing import Protocol, Callable, Any, Awaitable, TypeVar, Generic, Optional, Union, Coroutine, TypeGuard, ParamSpec, Concatenate
 
 import logging
 
@@ -55,49 +55,50 @@ logger = logging.getLogger(__name__)
 
 T = TypeVar('T')
 R = TypeVar('R')
+P = ParamSpec("P")
+
+class _CTProperty(Generic[T]):
+    def __init__(self, parent: 'CleanupTasks[T]'):
+        self._parent = parent
+    
+    @property
+    def cleanup_handler(self) -> MaybeCoroutineOrCallableOrNone[T, R]:
+        return self._parent.handler
+    
+    @cleanup_handler.setter
+    def cleanup_handler(self, handler: Callable[[T], Any]) -> None:
+        self._parent.handler = handler
+    
+    @property
+    def runs_in_task(self) -> bool:
+        return self._parent.runs_in_task
+
+    @runs_in_task.setter
+    def runs_in_task(self, flag: bool) -> None:
+        self._parent.runs_in_task = flag
+    
+    def update_cleanup_interval(self, interval: int) -> None:
+        return self._parent.update_cleanup_interval(interval)
+
 
 
 class CleanupTasks(Generic[T]):
 
-    class Property(Generic[T]):
-        def __init__(self, parent: 'CleanupTasks[T]'):
-            self._parent = parent
-        
-        @property
-        def cleanup_handler(self) -> Optional[Callable[[T], Any]]:
-            return self._parent.cleanup_handler
-        
-        @cleanup_handler.setter
-        def cleanup_handler(self, handler: Callable[[T], Any]) -> None:
-            self._parent.cleanup_handler = handler
-        
-        @property
-        def runs_in_task(self) -> bool:
-            return self._parent.runs_in_task
-
-        @runs_in_task.setter
-        def runs_in_task(self, flag: bool) -> None:
-            self._parent.runs_in_task = flag
-        
-        def update_cleanup_interval(self, interval: int) -> None:
-            return self._parent.update_cleanup_interval(interval)
-
-
     def __init__(self, cleanup_interval: int = 100):
         self.__pending_cleanup_tasks: set[asyncio.Task[T]] = set()
-        self.__cleanup_handler: Optional[Callable[[T], Any]] = None
+        self.__cleanup_handler: MaybeCoroutineOrCallableOrNone[T, Any] = None
         self.__cleanup_task_runs_in_task: bool = False
         self.__cleanup_interval: int = cleanup_interval
         self.__clear_count: int = 0
-        self.__prop: CleanupTasks[T].Property[T] = type(self).Property(self)
+        self.__prop: _CTProperty[T] = _CTProperty(self)
         vlog_on_instance_created_with_args(self, cleanup_interval)
 
     @property
-    def cleanup_handler(self) -> Optional[Callable[[T], Any]]:
+    def handler(self) -> MaybeCoroutineOrCallableOrNone[T, R]:
         return self.__cleanup_handler
 
-    @cleanup_handler.setter
-    def cleanup_handler(self, handler: Callable[[T], Any]) -> None:
+    @handler.setter
+    def handler(self, handler: Callable[[T], Any]) -> None:
         self.__cleanup_handler = handler
 
     @property
@@ -127,10 +128,10 @@ class CleanupTasks(Generic[T]):
         self.__cleanup_interval = interval
     
     @property
-    def prop(self) -> Property[T]:
+    def prop(self) -> _CTProperty[T]:
         return self.__prop
 
-    async def cleanup(self, obj: T, timeout: Optional[float] = None, resumes: bool = True) -> None:
+    async def cleanup(self, obj: ValidValue[T], timeout: TimeoutType = None, resumes: bool = True) -> None:
         MN = "cleanup"
         vlog_on_called(self, MN)
         self.__clear_count += 1
@@ -139,9 +140,10 @@ class CleanupTasks(Generic[T]):
             self._collect_done_tasks()
             self.__clear_count = 0
         try:
-            if self.cleanup_handler is not None:
-                result = self.cleanup_handler(obj)
-                if inspect.isawaitable(result):
+            if self.handler is not None:
+                if isinstance(self.handler, Callable):
+                    result = self.handler(obj)
+                if inspect.iscoroutine(result):
                     if self.runs_in_task:
                         vlog_on_task_created(self, MN, "cleanup handler is awaitable, running in task")
                         task = asyncio.create_task(result)
@@ -199,20 +201,96 @@ class CleanupTasks(Generic[T]):
     def _collect_done_tasks(self) -> None:
         self.__pending_cleanup_tasks = {t for t in self.__pending_cleanup_tasks if not t.done()}
 
+class ExclusiveLock(Protocol):
+    """
+    An interface for locks that provide exclusive access to a resource in asynchronous contexts.
+
+    This protocol applies to locks that meet the following conditions:
+    - The lock is acquired and released by a single task.
+    - Multiple tasks do not hold the lock simultaneously.
+
+    Suitable for locks like asyncio.Lock or asyncio.Condition that enforce mutual exclusion.
+    Not suitable for counting locks like asyncio.Semaphore that allow multiple concurrent holders.
+
+    This protocol does not include dynamic validation of a lock’s internal behavior,
+    so users must ensure that the provided lock conforms to the intended constraints.
+
+    ja:
+    非同期コンテキストで排他的にリソースを制御するロックのインタフェースです。
+
+    このプロトコルは以下の要件を満たすロックに適用されます：
+    - 単一のタスクによってロックが取得および解放されること
+    - 同時に複数のタスクがロックを保持することがないこと
+
+    asyncio.Lock や asyncio.Condition など、1タスクずつ排他制御を行うロックに適しています。
+    一方、asyncio.Semaphore のように複数タスクによる同時取得が可能なロック（カウント型ロック）は対象外です。
+
+    このプロトコルではロックの内部構造や挙動を動的に検証する手段を提供しないため、
+    使用者は与えるロックが本プロトコルの設計意図に沿ったものであることを保証する必要があります。
+    """
+    async def acquire(self): ...
+    def release(self): ...
+    def locked(self): ...
+
+
 
 @asynccontextmanager
-async def acquire_lock_with_timeout(obj, mn: str, lock: asyncio.Lock, timeout: Optional[float]):
+async def acquire_lock_with_timeout(
+    exlock: ExclusiveLock,
+    *,
+    callee: Any = DEFAULT_CALLEE,
+    mn: str = "<unknown>",
+    after_set: Optional[asyncio.Event] = None,
+    after_clear: Optional[asyncio.Event] = None,
+    timeout: TimeoutType = None):
+    """
+    An async context manager that acquires a lock with timeout and optionally signals completion via events.
+
+    - Attempts to acquire the given lock (exlock) within the specified timeout period.
+    - If the block completes successfully:
+        - `after_set` is set() if provided (e.g., to notify completion)
+        - `after_clear` is cleared() if provided (e.g., to reset waiting conditions)
+    - Does not change any event state at the start of processing.
+    - Raises LockTimeout if acquisition times out.
+    - Automatically releases the lock if it is still held after execution.
+
+    This function assumes the provided lock follows the ExclusiveLock protocol.
+    Locks such as asyncio.Semaphore that permit concurrent acquisition are not supported.
+    The function cannot verify lock type internally, so callers are responsible for providing a compliant lock.
+
+    ja:
+    非同期ロックをタイムアウト付きで取得し、取得後の処理完了時にイベント通知を行うコンテキストマネージャです。
+
+    - 指定したロック（exlock）を timeout 秒以内に取得します。
+    - 正常に処理が完了した場合：
+        - `after_set` が指定されていれば set() されます（例：完了通知）
+        - `after_clear` が指定されていれば clear() されます（例：待機解除）
+    - 処理の開始時にはイベントの状態変化は行いません。
+    - タイムアウト時は LockTimeout を送出します。
+    - 処理後にロックが保持されていれば自動で release されます。
+
+    この関数は ExclusiveLock プロトコルに準拠したロックを前提としています。
+    asyncio.Semaphore などの複数タスクによる同時取得が可能なロックには対応していません。
+    ただし、関数内でロックの種類を検査する手段はないため、適切なロックを渡す責任は呼び出し側にあります。
+    """
+    done = False
     try:
-        await asyncio.wait_for(lock.acquire(), timeout=timeout)
+        await asyncio.wait_for(exlock.acquire(), timeout=timeout)
         yield
+        done = True
     except asyncio.TimeoutError as e:
         logger.warning(f"Lock acquisition timed out after {timeout} seconds")
-        raise LockTimeout("ロック取得タイムアウト") from e
+        raise LockTimeout("Timeout acquring lock.") from e
     finally:
-        if lock.locked():
-            lock.release()
-            vlog_on_lock_released(obj, mn)
-
+        if done:
+            if after_set:
+                after_set.set()
+            if after_clear:
+                after_clear.clear()
+        if exlock.locked():
+            exlock.release()
+            vlog_on_lock_released(callee, mn)
+    
 
 # 共有オブジェクトが既にクローズされている場合に投げる例外
 class SharedObjectClosed(Exception):
@@ -228,16 +306,65 @@ class HandlerTimeout(asyncio.TimeoutError):
     """ハンドラ処理のタイムアウト時に投げられる例外"""
     pass
 
-# 無効値を表す番兵オブジェクト
-class InvalidValue:
-    '''
-    無効値を表す。値オブジェクトはAsyncSharedObject.INVALID_VALUEから参照する
-    AsyncSharedObject以外はこのクラスをインスタンス化しないこと
-    Genericの型指定のみに使用する
-    '''
-    def __repr__(self):
-        return "<INVALID_VALUE>"
 
+
+
+
+class _ObjectGetter(Generic[T]):
+    def __init__(self, parent: 'AsyncSharedObject[T]'):
+        self._parent = parent
+
+    async def get(self) -> T:
+        return await self._parent.get()
+
+class _ObjectSetter(Generic[T]):
+    def __init__(self, parent: 'AsyncSharedObject[T]'):
+        self._parent = parent
+
+    async def set(self, obj: T) -> None:
+        await self._parent.set(obj)
+
+    async def get(self) -> T:
+        return await self._parent.get()
+
+class _ObjectDeleter(Generic[T]):
+    def __init__(self, parent: 'AsyncSharedObject[T]'):
+        self._parent = parent
+
+    async def clear(self) -> T:
+        return await self._parent.clear()
+
+class _ObjectUpdater(Generic[T]):
+    def __init__(self, parent: 'AsyncSharedObject[T]'):
+        self._parent = parent
+
+    async def set(self, obj: T) -> None:
+        await self._parent.set(obj)
+
+    async def clear(self) -> None:
+        await self._parent.clear()
+
+    async def get(self) -> T:
+        return await self._parent.get()
+
+class _ObjectRawRef(Generic[T]):
+    def __init__(self, parent: 'AsyncSharedObject[T]'):
+        self._parent = parent
+
+    def set(self, obj: T) -> None:
+        self._parent._set_without_lock(obj)
+
+    def clear(self) -> None:
+        self._parent._clear_without_lock()
+
+    def get(self) -> T:
+        return self._parent._get_without_wait()
+
+    def close(self) -> None:
+        self._parent._close_without_lock()
+
+    def closed(self) -> bool:
+        return self._parent._closed
 
 
 class AsyncSharedObject(Generic[T]):
@@ -305,92 +432,40 @@ class AsyncSharedObject(Generic[T]):
             closed_value = await shared.close()
             print(f"Value at close: {closed_value}")
     """
-    class Getter(Generic[T]):
-        def __init__(self, parent: 'AsyncSharedObject[T]'):
-            self._parent = parent
 
-        async def get(self) -> T:
-            return await self._parent.get()
-
-    class Setter(Generic[T]):
-        def __init__(self, parent: 'AsyncSharedObject[T]'):
-            self._parent = parent
-
-        async def set(self, obj: T) -> None:
-            await self._parent.set(obj)
-
-        async def get(self) -> T:
-            return await self._parent.get()
-
-    class Deleter(Generic[T]):
-        def __init__(self, parent: 'AsyncSharedObject[T]'):
-            self._parent = parent
-
-        async def clear(self) -> T:
-            return await self._parent.clear()
-
-    class Updater(Generic[T]):
-        def __init__(self, parent: 'AsyncSharedObject[T]'):
-            self._parent = parent
-
-        async def set(self, obj: T) -> None:
-            await self._parent.set(obj)
-
-        async def clear(self) -> None:
-            await self._parent.clear()
-
-        async def get(self) -> T:
-            return await self._parent.get()
-
-    class WithoutLockAccessor(Generic[T]):
-        def __init__(self, parent: 'AsyncSharedObject[T]'):
-            self._parent = parent
-
-        def set(self, obj: T) -> None:
-            self._parent._set_without_lock(obj)
-
-        def clear(self) -> None:
-            self._parent._clear_without_lock()
-
-        def get(self) -> T:
-            return self._parent._get_without_wait()
-
-        def close(self) -> None:
-            self._parent._close_without_lock()
-
-        def closed(self) -> bool:
-            return self._parent._closed
 
     INVALID_VALUE = InvalidValue()
+    _UNDEFINED_VALUE = object()
 
     def __init__(
         self,
         obj: Union[T, InvalidValue] = INVALID_VALUE,
         default: Union[T, InvalidValue] = INVALID_VALUE,
-        timeout: float = 1
+        timeout: TimeoutType = 1
     ):
-        self._lock = asyncio.Lock()
-        self._obj_is_enabled = asyncio.Event()
+        self._lock: asyncio.Lock = asyncio.Lock()
+        self._cond: asyncio.Condition = asyncio.Condition(self._lock)
+        self._updated: asyncio.Event = asyncio.Event()
+        #self._obj_is_enabled = asyncio.Event()
         self._default: Union[T, InvalidValue] = default
-        self._obj: Union[T, InvalidValue] = self._select_initial_value(obj, default)
+        self._obj: RawValue[T] = self._select_initial_value(obj, default)
         self._closed: bool = False
-        self._default_timeout = timeout
+        self._default_timeout: TimeoutType = timeout
 
-        cls = type(self)
-        self._obj_getter: AsyncSharedObject.Getter[T] = cls.Getter(self)
-        self._obj_setter: AsyncSharedObject.Setter[T] = cls.Setter(self)
-        self._obj_deleter: AsyncSharedObject.Deleter[T] = cls.Deleter(self)
-        self._obj_updater: AsyncSharedObject.Updater[T] = cls.Updater(self)
-        self._without_lock_accessor: AsyncSharedObject.WithoutLockAccessor[T] = cls.WithoutLockAccessor(self)
+        self._obj_getter: _ObjectGetter[T] = _ObjectGetter(self)
+        self._obj_setter: _ObjectSetter[T] = _ObjectSetter(self)
+        self._obj_deleter: _ObjectDeleter[T] = _ObjectDeleter(self)
+        self._obj_updater: _ObjectUpdater[T] = _ObjectUpdater(self)
+        self._without_lock_accessor: _ObjectRawRef[T] = _ObjectRawRef(self)
         self._obj_cleanup_tasks = CleanupTasks[T]()
         vlog_on_instance_created_with_args(self, obj, default, timeout)
 
     @classmethod
     def _select_initial_value(
         cls,
-        obj: Union[T, InvalidValue],
-        default: Union[T, InvalidValue]
-    ) -> Union[T, InvalidValue]:
+        obj: RawValue,
+        default: RawValue
+    ) -> RawValue:
         if obj is not cls.INVALID_VALUE:
             return obj
         elif default is not cls.INVALID_VALUE:
@@ -398,97 +473,119 @@ class AsyncSharedObject(Generic[T]):
         else:
             return cls.INVALID_VALUE
 
-    async def set(self, obj: T, lock_timeout: Optional[float] = None) -> Union[T, InvalidValue]:
+    async def set(self, obj: T, timeout: TimeoutType = None) -> None:
         MN = 'set'
         vlog_on_called(self, MN)
-        async with acquire_lock_with_timeout(self, MN, self._lock, lock_timeout):
+        old_obj = self.INVALID_VALUE
+        async with acquire_lock_with_timeout(
+            self, MN, self._cond, self._updated, timeout):
             vlog_on_lock_acquired(self, MN)
             if self._closed:
                 vlog_on_object_closed(self, MN)
                 raise SharedObjectClosed()
             old_obj = self._set_without_lock(obj)
-            return await self._obj_cleanup_tasks.cleanup(old_obj)
+            self._cond.notify_all()
+        if self.is_valid_value(old_obj):
+            await self._obj_cleanup_tasks.cleanup(old_obj)
 
 
-    async def clear(self, lock_timeout: Optional[float] = None) -> T:
+    async def clear(self, timeout: TimeoutType = None) -> None:
         MN = 'clear'
         vlog_on_called(self, MN)
-        async with acquire_lock_with_timeout(self, MN, self._lock, lock_timeout):
+        self._updated.clear()
+        UNDEFINED = self._UNDEFINED_VALUE
+        old_obj = UNDEFINED
+        async with acquire_lock_with_timeout(
+            self, MN, self._cond, complete = self._updated, timeout = timeout):
             vlog_on_lock_acquired(self, MN)
             if self._closed:
                 vlog_on_object_closed(self, MN)
                 raise SharedObjectClosed()
             old_obj = self._clear_without_lock()
-            return await self._obj_cleanup_tasks.cleanup(old_obj)
+            self._cond.notify_all()
+        if old_obj is not UNDEFINED:
+            if self.is_valid_value(old_obj):
+                await self._obj_cleanup_tasks.cleanup(old_obj)
+        else:
+            raise RuntimeError("Old object is missing")
 
-
-    async def get(self, lock_timeout: Optional[float] = None) -> T:
+    @classmethod
+    def is_valid_value(cls, value: RawValue[T]) -> TypeGuard[ValidValue[T]]:
+        return value is not None and value is not cls.INVALID_VALUE
+    
+    @classmethod
+    def is_optional_value(cls, value: RawValue[T]) -> TypeGuard[OptionalValue[T]]:
+        return value is not cls.INVALID_VALUE
+    
+    async def get(self, timeout: TimeoutType = None) -> OptionalValue[T]:
         MN = 'get'
         vlog_on_called(self, MN)
-        # 1回目のロック（クローズチェック）
-        async with acquire_lock_with_timeout(self, MN, self._lock, lock_timeout):
-            vlog_on_lock_acquired(self, MN, 'pre-wait')
-            if self._closed:
-                vlog_on_object_closed(self, MN)
-                raise SharedObjectClosed()
-        # イベントwait（ロック解放中に他コルーチンが値をセットできるようにする
-        vlog_on_wait_started(self, MN, 'wait event self._obj_is_enabled')
-        await self._obj_is_enabled.wait()
-        # 2回目のロック（値の取得）
-        async with acquire_lock_with_timeout(self, MN, self._lock, lock_timeout):
-            vlog_on_lock_acquired(self, MN, 'post-wait')
-            return self._get_without_wait()
+        async with acquire_lock_with_timeout(self, MN, self._cond, timeout):
+            vlog_on_lock_acquired(self, MN) #TODO: vlogのRENAME
+            value = self._obj
+            while not self.is_optional_value(value):
+                if self._closed:
+                    vlog_on_object_closed(self, MN)
+                    raise SharedObjectClosed()
+                vlog_on_wait_started(self, MN)
+                await self._cond.wait()
+                vlog_on_wait_finished(self, MN)
+                value = self._obj
+            return value
 
-
-    async def peek(self, lock_timeout: Optional[float] = None) -> Union[T, InvalidValue]:
+    
+    async def peek(self, timeout: TimeoutType = None) -> RawValue[T]:
         MN = 'peek'
         vlog_on_called(self, MN)
-        async with acquire_lock_with_timeout(self, MN, self._lock, lock_timeout):
-            vlog_on_lock_acquired(self, MN)
-            if self._closed:
-                vlog_on_object_closed(self, MN)
-                raise SharedObjectClosed()
+        async with acquire_lock_with_timeout(self, MN, self._cond, timeout):
+            vlog_on_lock_acquired(self, MN) #TODO: vlogのRENAME
             return self._obj
 
   
-    def _set_without_lock(self, obj: T) -> Union[T, InvalidValue]:
+    def _set_without_lock(self, obj: T) -> RawValue[T]:
         old_obj = self._obj
         self._obj = obj
-        self._obj_is_enabled.set()
         return old_obj
 
-    def _clear_without_lock(self) -> Union[T, InvalidValue]:
+    def _clear_without_lock(self) -> RawValue[T]:
         old_obj = self._obj
         self._obj = self._default
-        self._obj_is_enabled.clear()
         return old_obj
 
-    def _get_without_wait(self) -> T:
+    def _get_without_wait(self) -> RawValue[T]:
         return self._obj
 
   
-    async def close(self, lock_timeout: Optional[float] = None) -> WithoutLockAccessor[T]:
+    async def close(self, timeout: TimeoutType = None) -> None:
         MN = 'close'
         vlog_on_called(self, MN)
-        async with acquire_lock_with_timeout(self, MN, self._lock, lock_timeout):
+        self._close = True
+        try:
+            await self._updated.wait()
+        except Exception:
+            pass
+
+        async with acquire_lock_with_timeout(self, MN, self._cond, timeout):
             vlog_on_lock_acquired(self, MN)
             if self._closed:
                 vlog_on_object_closed(self, MN)
                 raise SharedObjectClosed()
             self._closed = True
+            final_value = self._obj
             self._obj = self.INVALID_VALUE
-            if hasattr(self, "_close_handler") and self._close_handler:
-                result = self._close_handler(self._without_lock_accessor)
-                if inspect.isawaitable(result):
-                    vlog_on_wait_started(self, MN, "awaiting close handler result.")
-                    await result
-                    vlog_on_wait_finished(self, MN, "awaiting close handler result.")
-            else:
-                #no close handler set
-                pass
-            return self._without_lock_accessor
+            self._cond.notify_all() # notifies shared object is closed
+        #TODO: vlog_cleanup_started(...)
+        if hasattr(self, "_close_handler") and self._close_handler:
+            result = self._close_handler(final_value)
+            if inspect.iscoroutine(result):
+                vlog_on_wait_started(self, MN, "awaiting close handler result.")
+                await result
+                vlog_on_wait_finished(self, MN, "awaiting close handler result.")
+        else:
+            #no close handler set
+            pass
 
-    def set_close_handler(self, handler: Callable[[WithoutLockAccessor[T]], Any]) -> None:
+    def set_close_handler(self, handler: Callable[[_ObjectRawRef[T]], Any]) -> None:
         self._close_handler = handler
     
     async def wait_cleanup_all(
@@ -498,64 +595,81 @@ class AsyncSharedObject(Generic[T]):
         await self._obj_cleanup_tasks.wait_all(all_timeout, per_task_timeout)
   
     @property
-    def cleanup_prop(self) -> CleanupTasks[T].Property:
+    def cleanup(self) -> _CTProperty[T]:
         return self._obj_cleanup_tasks.prop
     
     @property
-    def getter(self) -> Getter[T]:
+    def getter(self) -> _ObjectGetter[T]:
         return self._obj_getter
 
     @property
-    def setter(self) -> Setter[T]:
+    def setter(self) -> _ObjectSetter[T]:
         return self._obj_setter
 
     @property
-    def deleter(self) -> Deleter[T]:
+    def deleter(self) -> _ObjectDeleter[T]:
         return self._obj_deleter
 
     @property
-    def updater(self) -> Updater[T]:
+    def updater(self) -> _ObjectUpdater[T]:
         return self._obj_updater
 
-    async def closed(self, lock_timeout: Optional[float] = None) -> bool:
+    async def closed(self, timeout: Optional[float] = None) -> bool:
         MN = 'closed'
         vlog_on_called(self, MN)
-        async with acquire_lock_with_timeout(self, MN, self._lock, lock_timeout):
+        async with acquire_lock_with_timeout(self, MN, self._cond, timeout):
             vlog_on_lock_acquired(self, MN)
             return self._closed
 
     def _close_without_lock(self) -> None:
         self._closed = True
 
-    async def valid(self, lock_timeout: Optional[float] = None) -> bool:
-        return (await self.peek(lock_timeout=lock_timeout)) is not self.INVALID_VALUE
+    async def valid(self, timeout: Optional[float] = None) -> bool:
+        return self.is_valid_value(await self.peek(timeout=timeout))
 
     async def _lock_and_do(
         self,
-        handler: Callable[["AsyncSharedObject.WithoutLockAccessor[T]"], Union[R, Awaitable[R]]],
+        handler: Callable[Concatenate[_ObjectRawRef[T], P], Any],
+        *args,
+        lock_timeout: Optional[float] = None,
+        **kwargs
+    ) -> Any:
+        MN = '_lock_and_do'
+        vlog_on_called(self, MN)
+        async with acquire_lock_with_timeout(self, MN, self._cond, lock_timeout):
+            vlog_on_lock_acquired(self, MN)
+            if self._closed:
+                vlog_on_object_closed(self, MN)
+                raise SharedObjectClosed()
+            return handler(self._without_lock_accessor, *args, **kwargs)
+
+    async def _lock_and_async(
+        self,
+        handler: Callable[Concatenate[_ObjectRawRef[T], P], Any],
         *args,
         lock_timeout: Optional[float] = None,
         handler_timeout: Optional[float] = None,
         **kwargs
-    ) -> R:
+    ) -> Any:
         MN = '_lock_and_do'
         vlog_on_called(self, MN)
-        async with acquire_lock_with_timeout(self, MN, self._lock, lock_timeout):
+        async with acquire_lock_with_timeout(self, MN, self._cond, lock_timeout):
             vlog_on_lock_acquired(self, MN)
             if self._closed:
                 vlog_on_object_closed(self, MN)
                 raise SharedObjectClosed()
             result = handler(self._without_lock_accessor, *args, **kwargs)
-            if inspect.isawaitable(result):
+            if inspect.iscoroutine(result):
                 try:
                     vlog_on_wait_started(self, MN, "awaiting handler result.")
-                    r = await asyncio.wait_for(result, timeout=handler_timeout)
+                    awaited_result = await asyncio.wait_for(result, timeout=handler_timeout)
                     vlog_on_wait_finished(self, MN, "awaiting handler result.")
-                    return r
+                    return awaited_result
                 except asyncio.TimeoutError as e:
                     logger.warning("Handler execution timed out after %s seconds", handler_timeout)
                     raise HandlerTimeout("ハンドラ処理タイムアウト") from e
-            return result
+            else:
+                return result
 
 
     async def __aenter__(self):

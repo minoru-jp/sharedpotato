@@ -1,8 +1,7 @@
-#acyncvevent.py
 
 import logging
 
-verbose_logger = logging.getLogger(__name__ + ".verbose")
+verbose_logger = logging.getLogger(__name__)
 
 def vlog_on_instance_created(obj, msg: str = "") -> None:
     """

@@ -3,7 +3,7 @@ from sharedobj import AsyncSharedObject, CleanupTasks, InvalidValue
 
 T = TypeVar('T')
 
-SetRawAccessor: TypeAlias = AsyncSharedObject[set[T]].WithoutLockAccessor[set[T]]
+SetRawAccessor: TypeAlias = AsyncSharedObject[set[T]]._ObjectRawRef
 
 class AsyncSharedSet(Generic[T]):
     class Query(Generic[T]):
