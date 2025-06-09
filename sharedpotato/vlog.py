@@ -144,7 +144,7 @@ def get_vlog_factory(logger: logging.Logger) -> VlogFactory:
     def vlog_factory(
             label: str,
             prefix: str = LOG_CONTEXT,
-            suffix: str = " {msg}",
+            suffix: str = "{msg}",
             template: Optional[str] = None,
             level: int = logging.DEBUG
         ) -> VlogFunction:
