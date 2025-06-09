@@ -8,7 +8,12 @@ and a user-defined label or message.
 
 The term "Vlog" stands for "Verbose Log", emphasizing its purpose as a fine-grained,
 developer-focused diagnostic tool. Templates can be customized with prefixes, suffixes,
-or full format strings, and the log level is adjustable (default: DEBUG).
+or full format strings.
+
+Log level:
+    The factory accepts a `level` argument (default: DEBUG), which sets the **default log level**
+    for the generated function. This level can still be **overridden at each individual call**
+    by passing `level=...` to the generated function.
 
 Usage example:
     template = "[{cls} id={id}].{mn} >> {label} {msg}"
@@ -36,7 +41,12 @@ Vlog は “Verbose Log” の略で、オブジェクトのライフサイク�
 生成される関数は、クラス名・オブジェクトID・メソッド名・任意のラベルやメッセージを
 一貫した形式で出力します。プレフィックスやサフィックス、完全なテンプレートを
 指定することで、柔軟な出力フォーマットが可能です。
-ログレベルも任意に設定できます（デフォルト: DEBUG）。
+
+ログレベル:
+    ファクトリは `level` 引数（デフォルト: DEBUG）を受け取り、
+    生成される関数の**デフォルトログレベル**を設定します。
+    ただし、生成された関数を呼び出す際に `level=...` を指定することで、
+    **個別のログ出力ごとに上書き**することも可能です。
 
 テンプレート構文で使用可能な変数:
     - {cls}   : 対象オブジェクトのクラス名
@@ -65,7 +75,7 @@ class VlogFunction(Protocol):
         obj: The target instance.
         mn: The method name where logging occurs.
         msg: Optional log message.
-        level: Logging level (default: DEBUG).
+        level: Logging level for this specific call (default: the factory's `level`).
 
     ja:
     オブジェクトの文脈を含めてログを出力する呼び出し可能オブジェクト。
@@ -74,7 +84,8 @@ class VlogFunction(Protocol):
         obj: 対象のインスタンス。
         mn: ログ出力元のメソッド名。
         msg: 任意のメッセージ。
-        level: ログ出力レベル（デフォルトは DEBUG）。
+        level: この呼び出しに対するログレベル。
+               指定しない場合はファクトリで設定されたレベルが使用されます。
     """
     def __call__(
             self,
@@ -82,7 +93,7 @@ class VlogFunction(Protocol):
             mn: str,
             msg: str = "",
             level: int = logging.DEBUG
-            ) -> None: ...
+        ) -> None: ...
 
 class VlogFactory(Protocol):
     """
@@ -93,6 +104,8 @@ class VlogFactory(Protocol):
         prefix: Format prefix before the label.
         suffix: Format suffix after the label.
         template: Full format string. Overrides prefix/suffix if provided.
+        level: Default log level to use for the generated function.
+               This can be overridden when calling the generated function.
 
     ja:
     文脈付きログ関数を生成する呼び出し可能オブジェクト。
@@ -103,14 +116,17 @@ class VlogFactory(Protocol):
         suffix: ラベルの後に出力されるフォーマット文字列。
         template: フォーマット全体を直接指定する場合に使用。
                   指定された場合は prefix/suffix を無視します。
+        level: 生成される関数のデフォルトのログレベル。
+               呼び出し時に `level=...` を指定して上書きできます。
     """
     def __call__(
             self,
             label: str,
             prefix: str = LOG_CONTEXT,
             suffix: str = " {msg}",
-            template: Optional[str] = None
-            ) -> VlogFunction: ...
+            template: Optional[str] = None,
+            level: int = logging.DEBUG
+        ) -> VlogFunction: ...
 
 def get_vlog_factory(logger: logging.Logger) -> VlogFactory:
     """
@@ -129,7 +145,9 @@ def get_vlog_factory(logger: logging.Logger) -> VlogFactory:
             label: str,
             prefix: str = LOG_CONTEXT,
             suffix: str = " {msg}",
-            template: Optional[str] = None) -> VlogFunction:
+            template: Optional[str] = None,
+            level: int = logging.DEBUG
+        ) -> VlogFunction:
         """
         Creates a logging function that outputs contextual messages with a given label.
 
@@ -148,6 +166,8 @@ def get_vlog_factory(logger: logging.Logger) -> VlogFactory:
             prefix: Format string prepended before the label (default: LOG_CONTEXT).
             suffix: Format string appended after the label. Typically includes `{msg}`.
             template: Full format string. If given, it is used directly instead of combining prefix, label, and suffix.
+            level: Default logging level for the generated function (default: DEBUG).
+                   Can be overridden on each call.
 
         ja:
         指定されたラベルを含む文脈付きログ関数を生成します。
@@ -168,7 +188,9 @@ def get_vlog_factory(logger: logging.Logger) -> VlogFactory:
             suffix: ラベルの後に追加されるフォーマット文字列。
                     通常は `{msg}` を含めて出力の末尾構造を定義します。
             template: フォーマット全体を直接指定する場合に使用されます。
-                    指定された場合は、他の3つの引数は無視されます。
+                      指定された場合は、他の3つの引数は無視されます。
+            level: この関数のデフォルトのログレベル（デフォルト: DEBUG）。
+                   呼び出し時に `level=...` を指定することで上書き可能です。
         """
         templ:str = prefix + " >>" + " {label} " + suffix \
                     if template is None else str(template)
@@ -178,7 +200,7 @@ def get_vlog_factory(logger: logging.Logger) -> VlogFactory:
                 obj,
                 mn: str,
                 msg: str = "",
-                level: int = logging.DEBUG) -> None:
+                level: int = level) -> None:
             """
             Function generated by the vlog factory to emit verbose log messages.
 
